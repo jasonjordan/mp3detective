@@ -21,7 +21,7 @@ wheels/
 *.egg
 
 # Virtual Environment
-venv/
+.venv/
 env/
 ENV/
 
@@ -41,3 +41,7 @@ output/*
 # OS specific
 .DS_Store
 Thumbs.db 
+
+# Coding
+
+.claude/

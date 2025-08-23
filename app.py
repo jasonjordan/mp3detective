@@ -5,8 +5,15 @@ import time
 import logging
 from pathlib import Path
 import shutil
+import requests
 
-import eyed3
+from mutagen.id3 import ID3NoHeaderError
+from mutagen import File as MutagenFile
+from mutagen.mp3 import MP3
+from mutagen.flac import FLAC
+from mutagen.mp4 import MP4
+from mutagen.oggvorbis import OggVorbis
+from mutagen.oggopus import OggOpus
 from openai import OpenAI
 from tqdm import tqdm
 
@@ -21,26 +28,42 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Hardcoded configuration
-INPUT_FOLDER = "input"
-OUTPUT_FOLDER = "output"
-API_KEY = "YOUR_OPENAI_API_KEY_HERE"
-MODEL = "gpt-4o"
-BATCH_SIZE = 10
-RATE_LIMIT_DELAY = 1.0
-OVERWRITE = True
+# ==========================================
+# HARDCODED CONFIGURATION
+# ==========================================
+
+# Directory settings
+INPUT_FOLDER = "input"                    # Folder containing your audio files
+OUTPUT_FOLDER = "output"                  # Folder where processed files will be saved
+
+# LLM Provider Configuration
+# Choose between "openai" or "ollama"
+LLM_PROVIDER = "ollama"                   # Options: "openai", "ollama"
+
+# OpenAI Configuration (only used if LLM_PROVIDER = "openai")
+OPENAI_API_KEY = "YOUR_OPENAI_API_KEY_HERE"    # Your OpenAI API key
+OPENAI_MODEL = "gpt-4o"                        # OpenAI model to use (gpt-4o, gpt-4.1, etc.)
+
+# Ollama Configuration (only used if LLM_PROVIDER = "ollama")
+OLLAMA_BASE_URL = "http://localhost:11434"     # Ollama server URL (default: http://localhost:11434)
+OLLAMA_MODEL = "gemma3:4b"                     # Ollama model to use (gemma3:4b, llama3.2, etc.)
+
+# Processing settings
+BATCH_SIZE = 10                          # Number of files to process before showing progress
+RATE_LIMIT_DELAY = 1.0                   # Delay between API calls in seconds
+OVERWRITE = True                         # Whether to overwrite existing metadata
 
 class MusicMetadataGenerator:
     def __init__(self):
         """
-        Initialize the Music MP3 metadata generator with hardcoded values.
+        Initialize the Music metadata generator for multiple audio formats with hardcoded values.
         """
         self.input_folder = Path(INPUT_FOLDER)
         self.output_folder = Path(OUTPUT_FOLDER)
-        self.model = MODEL
         self.batch_size = BATCH_SIZE
         self.rate_limit_delay = RATE_LIMIT_DELAY
         self.overwrite = OVERWRITE
+        self.llm_provider = LLM_PROVIDER.lower()
         
         # Ensure folders exist
         if not self.input_folder.exists():
@@ -50,13 +73,8 @@ class MusicMetadataGenerator:
             logger.info(f"Creating output folder: {self.output_folder}")
             self.output_folder.mkdir(parents=True, exist_ok=True)
             
-        # Initialize OpenAI client
-        try:
-            self.client = OpenAI(api_key=API_KEY)
-            logger.info(f"Initialized OpenAI client with model: {self.model}")
-        except Exception as e:
-            logger.error(f"Failed to initialize OpenAI client: {e}")
-            raise
+        # Initialize LLM client based on provider
+        self._initialize_llm_client()
 
         # Statistics for reporting
         self.stats = {
@@ -66,16 +84,81 @@ class MusicMetadataGenerator:
             "errors": 0,
             "skipped": 0
         }
-        
-    def get_mp3_files(self):
-        """Find all MP3 files in the input folder."""
+    
+    def _initialize_llm_client(self):
+        """Initialize the appropriate LLM client based on the configured provider."""
+        if self.llm_provider == "openai":
+            try:
+                self.client = OpenAI(api_key=OPENAI_API_KEY)
+                self.model = OPENAI_MODEL
+                logger.info(f"Initialized OpenAI client with model: {self.model}")
+            except Exception as e:
+                logger.error(f"Failed to initialize OpenAI client: {e}")
+                raise
+        elif self.llm_provider == "ollama":
+            try:
+                self.ollama_url = OLLAMA_BASE_URL.rstrip('/')
+                self.model = OLLAMA_MODEL
+                # Test Ollama connection
+                self._test_ollama_connection()
+                logger.info(f"Initialized Ollama client with model: {self.model} at {self.ollama_url}")
+            except Exception as e:
+                logger.error(f"Failed to initialize Ollama client: {e}")
+                raise
+        else:
+            raise ValueError(f"Unsupported LLM provider: {self.llm_provider}. Use 'openai' or 'ollama'")
+    
+    def _test_ollama_connection(self):
+        """Test connection to Ollama server."""
         try:
-            mp3_files = list(self.input_folder.glob("**/*.mp3"))
-            logger.info(f"Found {len(mp3_files)} MP3 files in {self.input_folder}")
-            self.stats["total_files"] = len(mp3_files)
-            return mp3_files
+            response = requests.get(f"{self.ollama_url}/api/tags", timeout=5)
+            if response.status_code != 200:
+                raise Exception(f"Ollama server responded with status {response.status_code}")
+        except requests.exceptions.RequestException as e:
+            raise Exception(f"Cannot connect to Ollama server at {self.ollama_url}: {e}")
+    
+    def _call_ollama_api(self, prompt):
+        """Make a request to Ollama API."""
+        try:
+            payload = {
+                "model": self.model,
+                "prompt": prompt,
+                "stream": False,
+                "format": "json"
+            }
+            
+            response = requests.post(
+                f"{self.ollama_url}/api/generate",
+                json=payload,
+                timeout=60
+            )
+            
+            if response.status_code != 200:
+                raise Exception(f"Ollama API returned status {response.status_code}: {response.text}")
+            
+            result = response.json()
+            return result.get("response", "")
+            
         except Exception as e:
-            logger.error(f"Error finding MP3 files: {e}")
+            logger.error(f"Error calling Ollama API: {e}")
+            raise
+        
+    def get_audio_files(self):
+        """Find all supported audio files in the input folder."""
+        try:
+            supported_extensions = ['*.mp3', '*.flac', '*.m4a', '*.mp4', '*.ogg', '*.opus']
+            audio_files = []
+            
+            for extension in supported_extensions:
+                files = list(self.input_folder.glob(f"**/{extension}"))
+                audio_files.extend(files)
+            
+            logger.info(f"Found {len(audio_files)} audio files in {self.input_folder}")
+            logger.info(f"Supported formats: {', '.join([ext.replace('*.', '.') for ext in supported_extensions])}")
+            self.stats["total_files"] = len(audio_files)
+            return audio_files
+        except Exception as e:
+            logger.error(f"Error finding audio files: {e}")
             return []
     
     def clean_filename(self, filename):
@@ -95,8 +178,8 @@ class MusicMetadataGenerator:
         
         return name
     
-    def get_metadata_from_gpt(self, song_name):
-        """Query GPT-4o to get metadata for a song."""
+    def get_metadata_from_llm(self, song_name):
+        """Query the configured LLM to get metadata for a song."""
         prompt = f"""
         I need detailed metadata for the song titled "{song_name}". 
         
@@ -137,26 +220,13 @@ class MusicMetadataGenerator:
         """
         
         try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                response_format={"type": "json_object"},
-                messages=[
-                    {"role": "system", "content": "You are a music metadata expert with comprehensive knowledge of music across all genres, artists, and time periods. Provide accurate metadata in JSON format ONLY. Do not include any explanations or comments outside the JSON object."},
-                    {"role": "user", "content": prompt}
-                ]
-            )
-            
-            # Parse the response
-            metadata_json = response.choices[0].message.content
-            try:
-                metadata = json.loads(metadata_json)
-                logger.debug(f"Got metadata for '{song_name}': {metadata}")
-                return metadata
-            except json.JSONDecodeError as e:
-                logger.error(f"Failed to parse JSON from GPT response: {e}")
-                logger.error(f"Raw response: {metadata_json}")
-                return {"title": song_name, "error": "Failed to parse response"}
-            
+            if self.llm_provider == "openai":
+                return self._get_metadata_from_openai(prompt, song_name)
+            elif self.llm_provider == "ollama":
+                return self._get_metadata_from_ollama(prompt, song_name)
+            else:
+                raise ValueError(f"Unsupported LLM provider: {self.llm_provider}")
+                
         except Exception as e:
             logger.error(f"Error getting metadata for '{song_name}': {e}")
             return {
@@ -164,8 +234,56 @@ class MusicMetadataGenerator:
                 "title": song_name
             }
     
-    def update_mp3_metadata(self, file_path, metadata):
-        """Update the ID3 tags of an MP3 file with the provided metadata."""
+    def _get_metadata_from_openai(self, prompt, song_name):
+        """Get metadata using OpenAI API."""
+        response = self.client.chat.completions.create(
+            model=self.model,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": "You are a music metadata expert with comprehensive knowledge of music across all genres, artists, and time periods. Provide accurate metadata in JSON format ONLY. Do not include any explanations or comments outside the JSON object."},
+                {"role": "user", "content": prompt}
+            ]
+        )
+        
+        metadata_json = response.choices[0].message.content
+        try:
+            metadata = json.loads(metadata_json)
+            logger.debug(f"Got metadata for '{song_name}': {metadata}")
+            return metadata
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse JSON from OpenAI response: {e}")
+            logger.error(f"Raw response: {metadata_json}")
+            return {"title": song_name, "error": "Failed to parse OpenAI response"}
+    
+    def _get_metadata_from_ollama(self, prompt, song_name):
+        """Get metadata using Ollama API."""
+        system_prompt = "You are a music metadata expert with comprehensive knowledge of music across all genres, artists, and time periods. Provide accurate metadata in JSON format ONLY. Do not include any explanations or comments outside the JSON object."
+        
+        full_prompt = f"{system_prompt}\n\n{prompt}"
+        
+        response_text = self._call_ollama_api(full_prompt)
+        
+        try:
+            metadata = json.loads(response_text)
+            logger.debug(f"Got metadata for '{song_name}': {metadata}")
+            return metadata
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse JSON from Ollama response: {e}")
+            logger.error(f"Raw response: {response_text}")
+            # Try to extract JSON from the response if it contains other text
+            try:
+                import re
+                json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+                if json_match:
+                    metadata = json.loads(json_match.group())
+                    logger.debug(f"Extracted metadata for '{song_name}': {metadata}")
+                    return metadata
+            except:
+                pass
+            return {"title": song_name, "error": "Failed to parse Ollama response"}
+    
+    def update_audio_metadata(self, file_path, metadata):
+        """Update the metadata tags of an audio file with the provided metadata."""
         try:
             # Create output path (convert Path to string to avoid issues)
             output_path = str(self.output_folder / file_path.name)
@@ -175,93 +293,266 @@ class MusicMetadataGenerator:
             logger.info(f"Copying file to output folder: {output_path}")
             shutil.copy2(source_path, output_path)
             
-            # Load the MP3 file (working with the output path)
-            audiofile = eyed3.load(output_path)
+            # Load the audio file using mutagen
+            audiofile = MutagenFile(output_path)
             
             # Check if the file was loaded properly
             if audiofile is None:
-                logger.error(f"Failed to load MP3 file {output_path}")
+                logger.error(f"Failed to load audio file {output_path}")
                 self.stats["errors"] += 1
                 return False
             
-            # Initialize ID3 tag if it doesn't exist
-            if audiofile.tag is None:
-                audiofile.initTag(version=(2, 3, 0))
-            elif not self.overwrite and (audiofile.tag.title or audiofile.tag.artist):
+            file_ext = file_path.suffix.lower()
+            
+            # Check for existing metadata and skip if overwrite is False
+            if not self.overwrite and self._has_existing_metadata(audiofile, file_ext):
                 logger.info(f"Skipping '{file_path.name}' - already has metadata and overwrite is False")
                 self.stats["skipped"] += 1
                 return False
                 
-            # Update the tags with our metadata
-            if metadata.get("title"):
-                audiofile.tag.title = str(metadata["title"])
-                
-            if metadata.get("artists"):
-                # Ensure artists is a string, not a list
-                if isinstance(metadata["artists"], list):
-                    audiofile.tag.artist = ", ".join(str(a) for a in metadata["artists"])
-                else:
-                    audiofile.tag.artist = str(metadata["artists"])
-                    
-            if metadata.get("album"):
-                audiofile.tag.album = str(metadata["album"])
-                
-            # Handle year safely
-            if metadata.get("year"):
-                try:
-                    year_val = str(metadata["year"])
-                    if year_val.isdigit():
-                        audiofile.tag.recording_date = year_val
-                except (ValueError, TypeError) as e:
-                    logger.warning(f"Invalid year value '{metadata.get('year')}': {e}")
-                
-            if metadata.get("composer"):
-                audiofile.tag.composer = str(metadata["composer"])
-                
-            if metadata.get("language"):
-                # Use comments for language
-                audiofile.tag.comments.set(f"Language: {metadata['language']}")
-                
-            if metadata.get("genre"):
-                # Set genre safely
-                try:
-                    audiofile.tag.genre = str(metadata["genre"])
-                except Exception as e:
-                    logger.warning(f"Error setting genre '{metadata.get('genre')}': {e}")
-                    # Try setting genre as a comment instead
-                    audiofile.tag.comments.set(f"Genre: {metadata['genre']}")
+            # Update metadata based on file format
+            if file_ext == '.mp3':
+                success = self._update_mp3_tags(audiofile, metadata)
+            elif file_ext == '.flac':
+                success = self._update_flac_tags(audiofile, metadata)
+            elif file_ext in ['.m4a', '.mp4']:
+                success = self._update_mp4_tags(audiofile, metadata)
+            elif file_ext == '.ogg':
+                success = self._update_ogg_tags(audiofile, metadata)
+            elif file_ext == '.opus':
+                success = self._update_opus_tags(audiofile, metadata)
+            else:
+                logger.error(f"Unsupported file format: {file_ext}")
+                self.stats["errors"] += 1
+                return False
             
-            # Save the changes
-            audiofile.tag.save(output_path)
-            logger.info(f"Successfully updated metadata for '{file_path.name}' saved to {output_path}")
-            self.stats["success"] += 1
-            return True
+            if success:
+                # Save the changes
+                audiofile.save()
+                logger.info(f"Successfully updated metadata for '{file_path.name}' saved to {output_path}")
+                self.stats["success"] += 1
+                return True
+            else:
+                self.stats["errors"] += 1
+                return False
             
         except Exception as e:
             logger.error(f"Error updating metadata for '{file_path.name}': {str(e)}")
             self.stats["errors"] += 1
             return False
+    
+    def _has_existing_metadata(self, audiofile, file_ext):
+        """Check if the audio file already has metadata."""
+        try:
+            if file_ext == '.mp3':
+                return bool(audiofile.get('TIT2') or audiofile.get('TPE1'))
+            elif file_ext == '.flac':
+                return bool(audiofile.get('TITLE') or audiofile.get('ARTIST'))
+            elif file_ext in ['.m4a', '.mp4']:
+                return bool(audiofile.get('\xa9nam') or audiofile.get('\xa9ART'))
+            elif file_ext in ['.ogg', '.opus']:
+                return bool(audiofile.get('TITLE') or audiofile.get('ARTIST'))
+            return False
+        except:
+            return False
+    
+    def _update_mp3_tags(self, audiofile, metadata):
+        """Update MP3 ID3 tags."""
+        try:
+            from mutagen.id3 import TIT2, TPE1, TALB, TDRC, TCOM, TCON, COMM
+            
+            if metadata.get("title"):
+                audiofile['TIT2'] = TIT2(encoding=3, text=str(metadata["title"]))
+                
+            if metadata.get("artists"):
+                artists_str = metadata["artists"] if isinstance(metadata["artists"], str) else ", ".join(str(a) for a in metadata["artists"])
+                audiofile['TPE1'] = TPE1(encoding=3, text=artists_str)
+                    
+            if metadata.get("album"):
+                audiofile['TALB'] = TALB(encoding=3, text=str(metadata["album"]))
+                
+            if metadata.get("year"):
+                try:
+                    year_str = str(metadata["year"])
+                    if year_str.isdigit():
+                        audiofile['TDRC'] = TDRC(encoding=3, text=year_str)
+                except:
+                    pass
+                
+            if metadata.get("composer"):
+                audiofile['TCOM'] = TCOM(encoding=3, text=str(metadata["composer"]))
+                
+            if metadata.get("genre"):
+                audiofile['TCON'] = TCON(encoding=3, text=str(metadata["genre"]))
+                
+            if metadata.get("language"):
+                audiofile['COMM'] = COMM(encoding=3, lang='eng', desc='Language', text=str(metadata["language"]))
+            
+            return True
+        except Exception as e:
+            logger.error(f"Error updating MP3 tags: {e}")
+            return False
+    
+    def _update_flac_tags(self, audiofile, metadata):
+        """Update FLAC vorbis comments."""
+        try:
+            if metadata.get("title"):
+                audiofile['TITLE'] = str(metadata["title"])
+                
+            if metadata.get("artists"):
+                artists_str = metadata["artists"] if isinstance(metadata["artists"], str) else ", ".join(str(a) for a in metadata["artists"])
+                audiofile['ARTIST'] = artists_str
+                    
+            if metadata.get("album"):
+                audiofile['ALBUM'] = str(metadata["album"])
+                
+            if metadata.get("year"):
+                try:
+                    year_str = str(metadata["year"])
+                    if year_str.isdigit():
+                        audiofile['DATE'] = year_str
+                except:
+                    pass
+                
+            if metadata.get("composer"):
+                audiofile['COMPOSER'] = str(metadata["composer"])
+                
+            if metadata.get("genre"):
+                audiofile['GENRE'] = str(metadata["genre"])
+                
+            if metadata.get("language"):
+                audiofile['LANGUAGE'] = str(metadata["language"])
+            
+            return True
+        except Exception as e:
+            logger.error(f"Error updating FLAC tags: {e}")
+            return False
+    
+    def _update_mp4_tags(self, audiofile, metadata):
+        """Update MP4/M4A tags."""
+        try:
+            if metadata.get("title"):
+                audiofile['\xa9nam'] = str(metadata["title"])
+                
+            if metadata.get("artists"):
+                artists_str = metadata["artists"] if isinstance(metadata["artists"], str) else ", ".join(str(a) for a in metadata["artists"])
+                audiofile['\xa9ART'] = artists_str
+                    
+            if metadata.get("album"):
+                audiofile['\xa9alb'] = str(metadata["album"])
+                
+            if metadata.get("year"):
+                try:
+                    year_str = str(metadata["year"])
+                    if year_str.isdigit():
+                        audiofile['\xa9day'] = year_str
+                except:
+                    pass
+                
+            if metadata.get("composer"):
+                audiofile['\xa9wrt'] = str(metadata["composer"])
+                
+            if metadata.get("genre"):
+                audiofile['\xa9gen'] = str(metadata["genre"])
+                
+            if metadata.get("language"):
+                audiofile['\xa9lyr'] = f"Language: {metadata['language']}"
+            
+            return True
+        except Exception as e:
+            logger.error(f"Error updating MP4 tags: {e}")
+            return False
+    
+    def _update_ogg_tags(self, audiofile, metadata):
+        """Update OGG Vorbis comments."""
+        try:
+            if metadata.get("title"):
+                audiofile['TITLE'] = str(metadata["title"])
+                
+            if metadata.get("artists"):
+                artists_str = metadata["artists"] if isinstance(metadata["artists"], str) else ", ".join(str(a) for a in metadata["artists"])
+                audiofile['ARTIST'] = artists_str
+                    
+            if metadata.get("album"):
+                audiofile['ALBUM'] = str(metadata["album"])
+                
+            if metadata.get("year"):
+                try:
+                    year_str = str(metadata["year"])
+                    if year_str.isdigit():
+                        audiofile['DATE'] = year_str
+                except:
+                    pass
+                
+            if metadata.get("composer"):
+                audiofile['COMPOSER'] = str(metadata["composer"])
+                
+            if metadata.get("genre"):
+                audiofile['GENRE'] = str(metadata["genre"])
+                
+            if metadata.get("language"):
+                audiofile['LANGUAGE'] = str(metadata["language"])
+            
+            return True
+        except Exception as e:
+            logger.error(f"Error updating OGG tags: {e}")
+            return False
+    
+    def _update_opus_tags(self, audiofile, metadata):
+        """Update Opus comments."""
+        try:
+            if metadata.get("title"):
+                audiofile['TITLE'] = str(metadata["title"])
+                
+            if metadata.get("artists"):
+                artists_str = metadata["artists"] if isinstance(metadata["artists"], str) else ", ".join(str(a) for a in metadata["artists"])
+                audiofile['ARTIST'] = artists_str
+                    
+            if metadata.get("album"):
+                audiofile['ALBUM'] = str(metadata["album"])
+                
+            if metadata.get("year"):
+                try:
+                    year_str = str(metadata["year"])
+                    if year_str.isdigit():
+                        audiofile['DATE'] = year_str
+                except:
+                    pass
+                
+            if metadata.get("composer"):
+                audiofile['COMPOSER'] = str(metadata["composer"])
+                
+            if metadata.get("genre"):
+                audiofile['GENRE'] = str(metadata["genre"])
+                
+            if metadata.get("language"):
+                audiofile['LANGUAGE'] = str(metadata["language"])
+            
+            return True
+        except Exception as e:
+            logger.error(f"Error updating Opus tags: {e}")
+            return False
 
     def process_files(self):
-        """Process all MP3 files in the input folder."""
-        mp3_files = self.get_mp3_files()
-        if not mp3_files:
-            logger.warning("No MP3 files found to process.")
+        """Process all audio files in the input folder."""
+        audio_files = self.get_audio_files()
+        if not audio_files:
+            logger.warning("No audio files found to process.")
             return
             
-        logger.info(f"Starting to process {len(mp3_files)} files...")
+        logger.info(f"Starting to process {len(audio_files)} files...")
         
-        for i, file_path in enumerate(tqdm(mp3_files, desc="Processing MP3 files")):
+        for i, file_path in enumerate(tqdm(audio_files, desc="Processing audio files")):
             try:
                 # Extract song name from filename
                 song_name = self.clean_filename(file_path.name)
-                logger.info(f"Processing ({i+1}/{len(mp3_files)}): '{song_name}'")
+                logger.info(f"Processing ({i+1}/{len(audio_files)}): '{song_name}' [{file_path.suffix.upper()}]")
                 
-                # Get metadata from GPT
-                metadata = self.get_metadata_from_gpt(song_name)
+                # Get metadata from LLM
+                metadata = self.get_metadata_from_llm(song_name)
                 
-                # Update MP3 file with metadata
-                success = self.update_mp3_metadata(file_path, metadata)
+                # Update audio file with metadata
+                success = self.update_audio_metadata(file_path, metadata)
                 
                 if not success and "error" in metadata:
                     logger.error(f"Failed to update metadata: {metadata.get('error')}")
@@ -270,11 +561,11 @@ class MusicMetadataGenerator:
                 self.stats["processed_files"] += 1
                 
                 # Print batch status
-                if (i + 1) % self.batch_size == 0 or i == len(mp3_files) - 1:
-                    logger.info(f"Progress: {i+1}/{len(mp3_files)} files processed.")
+                if (i + 1) % self.batch_size == 0 or i == len(audio_files) - 1:
+                    logger.info(f"Progress: {i+1}/{len(audio_files)} files processed.")
                     
                 # Delay to avoid rate limiting
-                if i < len(mp3_files) - 1:  # No need to delay after the last file
+                if i < len(audio_files) - 1:  # No need to delay after the last file
                     time.sleep(self.rate_limit_delay)
                     
             except Exception as e:
@@ -297,9 +588,17 @@ class MusicMetadataGenerator:
 
 def main():
     try:
-        print("Starting Music MP3 Metadata Generator")
+        print("Starting Music Metadata Generator (Multi-Format Support)")
         print(f"Input folder: {INPUT_FOLDER}")
         print(f"Output folder: {OUTPUT_FOLDER}")
+        print("Supported formats: MP3, FLAC, M4A, MP4, OGG, OPUS")
+        print(f"LLM Provider: {LLM_PROVIDER.upper()}")
+        
+        if LLM_PROVIDER.lower() == "openai":
+            print(f"OpenAI Model: {OPENAI_MODEL}")
+        elif LLM_PROVIDER.lower() == "ollama":
+            print(f"Ollama Model: {OLLAMA_MODEL}")
+            print(f"Ollama URL: {OLLAMA_BASE_URL}")
         
         generator = MusicMetadataGenerator()
         generator.process_files()
