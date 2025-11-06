@@ -5,7 +5,6 @@ import time
 import logging
 from pathlib import Path
 import shutil
-import requests
 
 from mutagen.id3 import ID3NoHeaderError
 from mutagen import File as MutagenFile
@@ -14,7 +13,7 @@ from mutagen.flac import FLAC
 from mutagen.mp4 import MP4
 from mutagen.oggvorbis import OggVorbis
 from mutagen.oggopus import OggOpus
-from openai import OpenAI
+import google.generativeai as genai
 from tqdm import tqdm
 
 # Configure logging
@@ -36,17 +35,9 @@ logger = logging.getLogger(__name__)
 INPUT_FOLDER = "input"                    # Folder containing your audio files
 OUTPUT_FOLDER = "output"                  # Folder where processed files will be saved
 
-# LLM Provider Configuration
-# Choose between "openai" or "ollama"
-LLM_PROVIDER = "ollama"                   # Options: "openai", "ollama"
-
-# OpenAI Configuration (only used if LLM_PROVIDER = "openai")
-OPENAI_API_KEY = "YOUR_OPENAI_API_KEY_HERE"    # Your OpenAI API key
-OPENAI_MODEL = "gpt-4o"                        # OpenAI model to use (gpt-4o, gpt-4.1, etc.)
-
-# Ollama Configuration (only used if LLM_PROVIDER = "ollama")
-OLLAMA_BASE_URL = "http://localhost:11434"     # Ollama server URL (default: http://localhost:11434)
-OLLAMA_MODEL = "gemma3:4b"                     # Ollama model to use (gemma3:4b, llama3.2, etc.)
+# Gemini Configuration
+GEMINI_API_KEY = "YOUR_GEMINI_API_KEY_HERE"    # Your Gemini API key
+GEMINI_MODEL = "gemini-1.5-flash"              # Gemini model to use
 
 # Processing settings
 BATCH_SIZE = 10                          # Number of files to process before showing progress
@@ -63,7 +54,6 @@ class MusicMetadataGenerator:
         self.batch_size = BATCH_SIZE
         self.rate_limit_delay = RATE_LIMIT_DELAY
         self.overwrite = OVERWRITE
-        self.llm_provider = LLM_PROVIDER.lower()
         
         # Ensure folders exist
         if not self.input_folder.exists():
@@ -73,8 +63,8 @@ class MusicMetadataGenerator:
             logger.info(f"Creating output folder: {self.output_folder}")
             self.output_folder.mkdir(parents=True, exist_ok=True)
             
-        # Initialize LLM client based on provider
-        self._initialize_llm_client()
+        # Initialize Gemini client
+        self._initialize_gemini_client()
 
         # Statistics for reporting
         self.stats = {
@@ -85,64 +75,16 @@ class MusicMetadataGenerator:
             "skipped": 0
         }
     
-    def _initialize_llm_client(self):
-        """Initialize the appropriate LLM client based on the configured provider."""
-        if self.llm_provider == "openai":
-            try:
-                self.client = OpenAI(api_key=OPENAI_API_KEY)
-                self.model = OPENAI_MODEL
-                logger.info(f"Initialized OpenAI client with model: {self.model}")
-            except Exception as e:
-                logger.error(f"Failed to initialize OpenAI client: {e}")
-                raise
-        elif self.llm_provider == "ollama":
-            try:
-                self.ollama_url = OLLAMA_BASE_URL.rstrip('/')
-                self.model = OLLAMA_MODEL
-                # Test Ollama connection
-                self._test_ollama_connection()
-                logger.info(f"Initialized Ollama client with model: {self.model} at {self.ollama_url}")
-            except Exception as e:
-                logger.error(f"Failed to initialize Ollama client: {e}")
-                raise
-        else:
-            raise ValueError(f"Unsupported LLM provider: {self.llm_provider}. Use 'openai' or 'ollama'")
-    
-    def _test_ollama_connection(self):
-        """Test connection to Ollama server."""
+    def _initialize_gemini_client(self):
+        """Initialize the Gemini client."""
         try:
-            response = requests.get(f"{self.ollama_url}/api/tags", timeout=5)
-            if response.status_code != 200:
-                raise Exception(f"Ollama server responded with status {response.status_code}")
-        except requests.exceptions.RequestException as e:
-            raise Exception(f"Cannot connect to Ollama server at {self.ollama_url}: {e}")
-    
-    def _call_ollama_api(self, prompt):
-        """Make a request to Ollama API."""
-        try:
-            payload = {
-                "model": self.model,
-                "prompt": prompt,
-                "stream": False,
-                "format": "json"
-            }
-            
-            response = requests.post(
-                f"{self.ollama_url}/api/generate",
-                json=payload,
-                timeout=60
-            )
-            
-            if response.status_code != 200:
-                raise Exception(f"Ollama API returned status {response.status_code}: {response.text}")
-            
-            result = response.json()
-            return result.get("response", "")
-            
+            genai.configure(api_key=GEMINI_API_KEY)
+            self.model = genai.GenerativeModel(GEMINI_MODEL)
+            logger.info(f"Initialized Gemini client with model: {GEMINI_MODEL}")
         except Exception as e:
-            logger.error(f"Error calling Ollama API: {e}")
+            logger.error(f"Failed to initialize Gemini client: {e}")
             raise
-        
+
     def get_audio_files(self):
         """Find all supported audio files in the input folder."""
         try:
@@ -179,7 +121,7 @@ class MusicMetadataGenerator:
         return name
     
     def get_metadata_from_llm(self, song_name):
-        """Query the configured LLM to get metadata for a song."""
+        """Query Gemini to get metadata for a song."""
         prompt = f"""
         I need detailed metadata for the song titled "{song_name}". 
         
@@ -220,13 +162,7 @@ class MusicMetadataGenerator:
         """
         
         try:
-            if self.llm_provider == "openai":
-                return self._get_metadata_from_openai(prompt, song_name)
-            elif self.llm_provider == "ollama":
-                return self._get_metadata_from_ollama(prompt, song_name)
-            else:
-                raise ValueError(f"Unsupported LLM provider: {self.llm_provider}")
-                
+            return self._get_metadata_from_gemini(prompt, song_name)
         except Exception as e:
             logger.error(f"Error getting metadata for '{song_name}': {e}")
             return {
@@ -234,54 +170,29 @@ class MusicMetadataGenerator:
                 "title": song_name
             }
     
-    def _get_metadata_from_openai(self, prompt, song_name):
-        """Get metadata using OpenAI API."""
-        response = self.client.chat.completions.create(
-            model=self.model,
-            response_format={"type": "json_object"},
-            messages=[
-                {"role": "system", "content": "You are a music metadata expert with comprehensive knowledge of music across all genres, artists, and time periods. Provide accurate metadata in JSON format ONLY. Do not include any explanations or comments outside the JSON object."},
-                {"role": "user", "content": prompt}
-            ]
-        )
-        
-        metadata_json = response.choices[0].message.content
+    def _get_metadata_from_gemini(self, prompt, song_name):
+        """Get metadata using Gemini API."""
         try:
+            response = self.model.generate_content(prompt)
+            metadata_text = response.text.strip()
+
+            # Clean the response to ensure it's valid JSON
+            json_match = re.search(r'\{.*\}', metadata_text, re.DOTALL)
+            if not json_match:
+                raise json.JSONDecodeError("No JSON object found in the response", metadata_text, 0)
+
+            metadata_json = json_match.group(0)
             metadata = json.loads(metadata_json)
             logger.debug(f"Got metadata for '{song_name}': {metadata}")
             return metadata
         except json.JSONDecodeError as e:
-            logger.error(f"Failed to parse JSON from OpenAI response: {e}")
-            logger.error(f"Raw response: {metadata_json}")
-            return {"title": song_name, "error": "Failed to parse OpenAI response"}
-    
-    def _get_metadata_from_ollama(self, prompt, song_name):
-        """Get metadata using Ollama API."""
-        system_prompt = "You are a music metadata expert with comprehensive knowledge of music across all genres, artists, and time periods. Provide accurate metadata in JSON format ONLY. Do not include any explanations or comments outside the JSON object."
-        
-        full_prompt = f"{system_prompt}\n\n{prompt}"
-        
-        response_text = self._call_ollama_api(full_prompt)
-        
-        try:
-            metadata = json.loads(response_text)
-            logger.debug(f"Got metadata for '{song_name}': {metadata}")
-            return metadata
-        except json.JSONDecodeError as e:
-            logger.error(f"Failed to parse JSON from Ollama response: {e}")
-            logger.error(f"Raw response: {response_text}")
-            # Try to extract JSON from the response if it contains other text
-            try:
-                import re
-                json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
-                if json_match:
-                    metadata = json.loads(json_match.group())
-                    logger.debug(f"Extracted metadata for '{song_name}': {metadata}")
-                    return metadata
-            except:
-                pass
-            return {"title": song_name, "error": "Failed to parse Ollama response"}
-    
+            logger.error(f"Failed to parse JSON from Gemini response: {e}")
+            logger.error(f"Raw response: {metadata_text}")
+            return {"title": song_name, "error": "Failed to parse Gemini response"}
+        except Exception as e:
+            logger.error(f"Error calling Gemini API: {e}")
+            return {"title": song_name, "error": str(e)}
+
     def update_audio_metadata(self, file_path, metadata):
         """Update the metadata tags of an audio file with the provided metadata."""
         try:
@@ -592,13 +503,8 @@ def main():
         print(f"Input folder: {INPUT_FOLDER}")
         print(f"Output folder: {OUTPUT_FOLDER}")
         print("Supported formats: MP3, FLAC, M4A, MP4, OGG, OPUS")
-        print(f"LLM Provider: {LLM_PROVIDER.upper()}")
-        
-        if LLM_PROVIDER.lower() == "openai":
-            print(f"OpenAI Model: {OPENAI_MODEL}")
-        elif LLM_PROVIDER.lower() == "ollama":
-            print(f"Ollama Model: {OLLAMA_MODEL}")
-            print(f"Ollama URL: {OLLAMA_BASE_URL}")
+        print(f"LLM Provider: Gemini")
+        print(f"Gemini Model: {GEMINI_MODEL}")
         
         generator = MusicMetadataGenerator()
         generator.process_files()
